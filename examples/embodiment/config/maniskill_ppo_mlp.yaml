@@ -86,7 +86,7 @@ env:
 
   # Override the default values in env/maniskill_pick_cube
   train:
-    total_num_envs: 1024
+    total_num_envs: 128
     auto_reset: True
     use_fixed_reset_state_ids: False
     max_episode_steps: 50 # max episode steps for truncation
