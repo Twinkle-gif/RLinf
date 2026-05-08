@@ -11,3 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+
+from .move_obj import MoveObjectEnv
+from .panda_put_on_in_scene_multi import PandaPutOnPlateInScene25
+from .put_carrot_on_plate import PutCarrotOnPlateInSceneV2
+from .put_on_in_scene_multi import PutOnPlateInScene25

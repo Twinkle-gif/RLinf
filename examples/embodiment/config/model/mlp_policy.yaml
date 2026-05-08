@@ -3,7 +3,7 @@ model_type: "mlp_policy"
 model_path: ""
 
 policy_setup: "panda-qpos"
-obs_dim: 42
+obs_dim: 41
 action_dim: 8
 num_action_chunks: 1
 hidden_dim: 256

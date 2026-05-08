@@ -15,7 +15,7 @@
 import asyncio
 import gc
 from collections import defaultdict
-from typing import Any, Literal
+from typing import Any, Literal, Protocol
 
 import numpy as np
 import torch
@@ -52,6 +52,26 @@ from rlinf.utils.utils import (
 from rlinf.workers.env.history_manager import HistoryManager
 
 
+class RLinfEnv(Protocol):
+    def chunk_step(self, chunk_actions: torch.Tensor) -> tuple:
+        """Take a chunk of actions and return a chunk of results.
+
+        The method processes a chunk of actions for multiple envs and returns a tuple of (obs_list, rewards, terminations, truncations, infos_list), where:
+        - obs_list is a list of observations for each step in the chunk, where each observation is a dict of tensors with shape [num_envs_per_stage, ...].
+        - rewards is a tensor of shape [num_envs_per_stage, chunk_size] representing the rewards for each env at each step in the chunk.
+        - terminations is a boolean tensor of shape [num_envs_per_stage, chunk_size] indicating whether each env terminated at each step in the chunk.
+        - truncations is a boolean tensor of shape [num_envs_per_stage, chunk_size] indicating whether each env was truncated at each step in the chunk.
+        - infos_list is a list of info dicts for each step in the chunk, where each info dict contains additional information about the env at that step.
+
+        Args:
+            chunk_actions: A tensor of shape [num_envs_per_stage, chunk_size, action_dim] representing the actions for each env at each step in the chunk.
+
+        Returns:
+            A tuple of (obs_list, rewards, terminations, truncations, infos_list) as described above.
+        """
+        ...
+
+
 class EnvWorker(Worker):
     def __init__(self, cfg: DictConfig):
         Worker.__init__(self)
@@ -61,9 +81,8 @@ class EnvWorker(Worker):
         self.eval_video_cnt = 0
         self.should_stop = False
 
-        self.env_list = []
-        self.eval_env_list = []
-
+        self.env_list:list[RLinfEnv]= []
+        self.eval_env_list:list[RLinfEnv] = []
         self.last_obs_list = []
         self.last_intervened_info_list = []
         self._prefetched_train_bootstrap: list[EnvOutput] | None = None
@@ -418,7 +437,7 @@ class EnvWorker(Worker):
         env_info = {}
 
         obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list = (
-            self.env_list[stage_id].chunk_step(chunk_actions)
+            self.env_list[stage_id].chunk_step(chunk_actions) # 此处是与环境进行交互的核心，调用了环境的chunk_step方法，传入一个chunk的动作，得到一个chunk的结果，包括obs_list, chunk_rewards, chunk_terminations, chunk_truncations, infos_list
         )
         if isinstance(obs_list, (list, tuple)):
             extracted_obs = obs_list[-1] if obs_list else None
@@ -911,6 +930,11 @@ class EnvWorker(Worker):
 
     @Worker.timer("env/bootstrap_step")
     def bootstrap_step(self) -> list[EnvOutput]:
+        '''
+        用于训练开始时初始化环境状态，分为两种情况：
+        1. 如果auto_reset为True，则调用reset方法初始化环境状态；
+        2. 如果auto_reset为False，则调用get_reset_state_ids方法获取初始状态ID，并调用get_reset_states方法获取初始状态。
+        '''
         def get_zero_dones() -> torch.Tensor:
             return (
                 torch.zeros((self.train_num_envs_per_stage,), dtype=bool)
@@ -921,7 +945,7 @@ class EnvWorker(Worker):
         env_outputs: list[EnvOutput] = []
         if not self.cfg.env.train.auto_reset:
             for stage_id in range(self.stage_num):
-                self.env_list[stage_id].is_start = True
+                self.env_list[stage_id].is_start = True # XXX: 这里的is_start变量没有再EnvOutput类中定义
                 extracted_obs, infos = self.env_list[stage_id].reset()
                 dones = get_zero_dones()
                 terminations = dones.clone()
@@ -1044,6 +1068,8 @@ class EnvWorker(Worker):
         env_metrics = defaultdict(list)
 
         for epoch in range(self.rollout_epoch):
+            # 这个循环的作用是控制整个rollout的轮数（epochs），每个epoch代表一次完整的轨迹收集过程。
+            # 比如在参考的PPO算法中，rollout_epoch默认设为1.
             if epoch == 0 and self._prefetched_train_bootstrap is not None:
                 env_outputs = self._prefetched_train_bootstrap
                 self._prefetched_train_bootstrap = None
@@ -1051,7 +1077,10 @@ class EnvWorker(Worker):
                 env_outputs = self._bootstrap_and_send_train(rollout_channel)
 
             for chunk_step_idx in range(self.n_train_chunk_steps):
+                # 执行主要的环境交互步骤，每个chunk_step对应一个action chunking(动作分块)，每个step对应实际执行了多少个底层环境步
+                # n_train_chunk_steps = max_steps_per_rollout_epoch // num_action_chunks
                 for stage_id in range(self.stage_num):
+                    #  在每个chunk_step中，依次处理所有pipeline stages的环境交互。
                     if cooperative_yield:
                         await asyncio.sleep(0)
 
@@ -1112,7 +1141,8 @@ class EnvWorker(Worker):
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
                         )
-
+                    # print("-------reached here 1-----------------------")
+                    # breakpoint()
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )
@@ -1138,6 +1168,7 @@ class EnvWorker(Worker):
                     self.record_env_metrics(env_metrics, env_info, epoch)
 
             for stage_id in range(self.stage_num):
+                # 处理每个epoch最后一个时间步的特殊逻辑,这是epoch的最后一步，可能需要特殊的reward计算或数据处理
                 env_output = env_outputs[stage_id]
                 if env_output.intervene_actions is not None:
                     self.rollout_results[stage_id].update_last_actions(
