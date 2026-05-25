@@ -7,12 +7,18 @@ use_full_state: False
 auto_reset: False
 ignore_terminations: False
 use_rel_reward: True
+# Potential-based reward shaping (Ng, Harada, Russell 1999):
+#   r'_t = gamma * Phi(s_{t+1}) - Phi(s_t)
+# gamma is taken from the PPO discount factor (algorithm.gamma) to keep the
+# shaping policy-invariant; the magnitude rescale 1/(1-gamma) is derived
+# from the same gamma inside the env wrapper, no extra config knobs needed.
+gamma: ${algorithm.gamma}
 reward_mode: raw
 seed: 0
 group_size: 1
 use_fixed_reset_state_ids: False
-max_steps_per_rollout_epoch: 50
-max_episode_steps: 50 # max episode steps for truncation
+max_steps_per_rollout_epoch: 500
+max_episode_steps: 500 # max episode steps for truncation
 
 video_cfg:
   save_video: False
@@ -22,7 +28,7 @@ video_cfg:
 enable_offload: False
 
 init_params:
-  id: "MoveObject-v1"
+  id: "DistributeObject-v1"
   num_envs: null # will be set in ManiSkillEnv init
   obs_mode: "state"
   control_mode: None

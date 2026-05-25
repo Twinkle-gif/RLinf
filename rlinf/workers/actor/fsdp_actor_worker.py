@@ -1102,7 +1102,7 @@ class EmbodiedFSDPActor(FSDPModelManager, Worker):
         for _ in range(split_num):
             trajectory: Trajectory = await input_channel.get(async_op=True).async_wait()
             recv_list.append(trajectory)
-
+        # breakpoint()
         self.rollout_batch = convert_trajectories_to_batch(recv_list)
 
         self.rollout_batch = self._process_received_rollout_batch(self.rollout_batch)

@@ -1,9 +1,8 @@
 defaults:
-  - env/maniskill_distribute_object@env.train
-  - env/maniskill_distribute_object@env.eval
+  - env/maniskill_move_object@env.train
+  - env/maniskill_move_object@env.eval
   - model/mlp_policy@actor.model
   - training_backend/fsdp@actor.fsdp_config
-  - weight_syncer/patch_syncer@weight_syncer
   - override hydra/job_logging: stdout
 
 hydra:

@@ -83,7 +83,7 @@ def compute_gae_advantages_and_returns(
     if normalize_returns:
         returns = safe_normalize(returns, loss_mask=loss_mask)
 
-    return advantages, returns
+    return advantages, returns # returns 是critic的更新目标V^{target}
 
 
 @register_advantage("grpo")

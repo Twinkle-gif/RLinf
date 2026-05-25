@@ -1141,8 +1141,6 @@ class EnvWorker(Worker):
                         self.rollout_results[stage_id].mark_last_step_with_flags(
                             rollout_result.save_flags
                         )
-                    # print("-------reached here 1-----------------------")
-                    # breakpoint()
                     env_output, env_info = self.env_interact_step(
                         rollout_result.actions, stage_id
                     )

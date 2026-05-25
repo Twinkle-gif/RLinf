@@ -249,6 +249,7 @@ class MultiStepRolloutWorker(Worker):
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
+        # breakpoint()
         kwargs = (
             self._train_sampling_params
             if mode == "train"
@@ -396,6 +397,7 @@ class MultiStepRolloutWorker(Worker):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
+                # breakpoint()
                 env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
 
@@ -427,6 +429,9 @@ class MultiStepRolloutWorker(Worker):
                     ),
                 )
                 self.send_rollout_result(output_channel, rollout_result, mode="train")
+        # 为什么需要下面这个循环，因为在EnvWorker类中的_run_interact_once方法中，先发送了初始化环境的数据（bootstrap观测），
+        # 然后发送了n_train_chunk_steps*num_pipeline_stages次数据，总的数据是1+n_train_chunk_steps*num_pipeline_stages，
+        # 所以需要这个循环去处理最后一步数据。
         for _ in range(self.num_pipeline_stages):
             env_output = await self.recv_env_output(input_channel)
             actions, result = self.predict(env_output["obs"])

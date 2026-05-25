@@ -50,10 +50,10 @@ class MoveObjectEnv(BaseEnv):
     agent: Union[Panda, Fetch, XArm6Robotiq, SO100, WidowXAI]
     goal_thresh = 0.03
     obj_half_size = 0.02
-    obj_spawn_region = [-0.1, 0.1, -0.15, -0.05]  # [min_x, max_x, min_y, max_y] for object spawn
-    goal_spawn_region = [-0.1, 0.1, 0.05, 0.15]   # [min_x, max_x, min_y, max_y] for goal spawn
+    obj_spawn_region = [-0.25, 0.2, -0.4, 0.4]  # [min_x, max_x, min_y, max_y] for object spawn
+    goal_spawn_region = [-0.25, 0.2, -0.4, 0.4]   # [min_x, max_x, min_y, max_y] for goal spawn
 
-    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.02, **kwargs):
+    def __init__(self, *args, robot_uids="panda", robot_init_qpos_noise=0.05, **kwargs):
         self.robot_init_qpos_noise = robot_init_qpos_noise
         if robot_uids in PICK_CUBE_CONFIGS:
             cfg = PICK_CUBE_CONFIGS[robot_uids]
@@ -92,7 +92,23 @@ class MoveObjectEnv(BaseEnv):
             self, robot_init_qpos_noise=self.robot_init_qpos_noise
         )
         self.table_scene.build()
-        
+        # try:
+        #     rb = self.table_scene.table._objs[0].find_component_by_type(sapien.render.RenderBodyComponent)
+        #     aabb = rb.compute_global_aabb_tight()  # (2,3): [[minx,miny,minz],[maxx,maxy,maxz]]
+        # except Exception:
+        #     # fallback: use collision box params from TableSceneBuilder
+        #     c = np.array([-0.12, 0.0, -0.9196429 / 2])
+        #     h = np.array([2.418 / 2, 1.209 / 2, 0.9196429 / 2])
+        #     aabb = np.stack([c - h, c + h], axis=0)
+
+        # print(f"[table AABB] min={aabb[0]}, max={aabb[1]}")
+        # breakpoint()
+        # # auto spawn region from AABB (safe margin)
+        # margin = float(self.obj_half_size + 0.01)
+        # self.obj_spawn_region = [aabb[0,0] + margin, aabb[1,0] - margin,
+        #                         aabb[0,1] + margin, aabb[1,1] - margin]
+        # self.goal_spawn_region = self.obj_spawn_region.copy()
+        # print(f"[spawn] {self.obj_spawn_region}")
         # Create the object to be pushed (red cube)
         self.obj = actors.build_cube(
             self.scene,
@@ -171,7 +187,7 @@ class MoveObjectEnv(BaseEnv):
         
         # Check if object is static (q velocity < 0.05)
         obj_velocity = self.obj.linear_velocity
-        is_obj_static = torch.linalg.norm(obj_velocity, axis=1) < 0.05
+        is_obj_static = torch.linalg.norm(obj_velocity, axis=1) < 0.01
         
         # Success requires both conditions
         success = is_obj_at_goal & is_obj_static
@@ -184,13 +200,16 @@ class MoveObjectEnv(BaseEnv):
         }
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
+        # breakpoint()
+        # num_envs = len(info["elapsed_steps"])
         # Distance from TCP to object (encourage approaching)
+        not_success_yet = ~info["success"]
         tcp_to_obj_dist = torch.linalg.norm(self.obj.pose.p - self.agent.tcp_pose.p, axis=1)
-        approach_reward = 1 - torch.tanh(5 * tcp_to_obj_dist)
-        
+        approach_raw = 1 - torch.tanh(5 * tcp_to_obj_dist)
+        approach_reward = approach_raw * not_success_yet
         # Distance from object to goal (main objective)
         obj_to_goal_dist = info["obj_to_goal_dist"]
-        push_reward = 1 - torch.tanh(5 * obj_to_goal_dist)
+        push_reward = (1 - torch.tanh(5 * obj_to_goal_dist))*3
         
         # # Contact reward (encourage touching the object)
         # # SAPIEN 3 的 GPU 物理后端不支持 get_contacts() 逐帧查询接触信息，该 API 仅在 CPU 模式下可用。
@@ -203,23 +222,17 @@ class MoveObjectEnv(BaseEnv):
         # contact_reward = float(has_contact) * 0.5
         
         # Static reward when object is near goal (encourage stopping)
-        static_reward = 0
-        if torch.any(info["is_obj_at_goal"]):
-            qvel = self.agent.robot.get_qvel()
-            if self.robot_uids in ["panda", "widowxai"]:
-                qvel = qvel[..., :-2]
-            elif self.robot_uids == "so100":
-                qvel = qvel[..., :-1]
-            static_reward = (1 - torch.tanh(5 * torch.linalg.norm(qvel, axis=1))) * info["is_obj_at_goal"].float()
+        obj_speed = torch.linalg.norm(self.obj.linear_velocity, axis=1)
+        static_reward = info["is_obj_static"].float()*info["is_obj_at_goal"].float()*(1-torch.tanh(5 * obj_speed))
         
         # Combine rewards
         reward = approach_reward + push_reward + static_reward
         
         # Bonus for success
-        reward[info["success"]] += 5
+        reward[info["success"]] += 3
         
         return reward
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        # Maximum possible reward: approach(1) + push(1)  + static(1) + success(5) = 8.5
-        return self.compute_dense_reward(obs=obs, action=action, info=info) / 8
+        # Maximum possible reward: approach(1) + push(3)  + static(0.2) + success(3) = 7.2
+        return self.compute_dense_reward(obs=obs, action=action, info=info) / 7.2

@@ -14,6 +14,7 @@
 
 from typing import Optional, OrderedDict, Union
 
+import os
 import gymnasium as gym
 import numpy as np
 import torch
@@ -58,6 +59,14 @@ class ManiskillEnv(gym.Env):
         self.worker_info = worker_info
         self.auto_reset = cfg.auto_reset
         self.use_rel_reward = cfg.use_rel_reward
+        # ----- Potential-based reward shaping (Ng, Harada, Russell 1999) -----
+        # When `use_rel_reward=True`, the per-step reward becomes
+        #     r'_t = gamma * Phi(s_{t+1}) - Phi(s_t)
+        # which is exactly the F function from Ng's Theorem 1 and preserves
+        # the optimal policy. `gamma` MUST equal the PPO discount factor
+        # (algorithm.gamma); the env yaml passes `gamma: ${algorithm.gamma}`
+        # so the two always stay in sync.
+        self._shaping_gamma = float(getattr(cfg, "gamma", 0.99))
         self.ignore_terminations = cfg.ignore_terminations
         self.use_full_state = bool(getattr(cfg, "use_full_state", False))
         self.num_group = num_envs // cfg.group_size
@@ -71,7 +80,7 @@ class ManiskillEnv(gym.Env):
         with open_dict(cfg):
             cfg.init_params.num_envs = num_envs
         env_args = OmegaConf.to_container(cfg.init_params, resolve=True)
-        self.env: BaseEnv = gym.make(**env_args)
+        self.env: BaseEnv = gym.make(**env_args) #这里返回的其实不是BaseEnv，而是经过了wrapper包装的，想要拿到BaseEnv需要用self.env.unwrapped   
         self.prev_step_reward = torch.zeros(self.num_envs, dtype=torch.float32).to(
             self.device
         )  # [B, ]
@@ -217,8 +226,13 @@ class ManiskillEnv(gym.Env):
             reward += info["is_src_obj_grasped"] * 0.1
             reward += info["consecutive_grasp"] * 0.1
             reward += (info["success"] & info["is_src_obj_grasped"]) * 1.0
-        # diff
-        reward_diff = reward - self.prev_step_reward
+        # Potential-based reward shaping (Ng, Harada, Russell 1999):
+        #   r'_t = gamma * Phi(s_{t+1}) - Phi(s_t)
+        # `reward` here is Phi(s_{t+1}) (post-step); `self.prev_step_reward`
+        # stores Phi(s_t) (seeded at reset via `_seed_prev_step_reward`).
+        # Policy-invariant in the optimal-policy sense.
+        reward_diff = self._shaping_gamma * reward - self.prev_step_reward
+        reward_diff = reward_diff / (1-self._shaping_gamma)  # rescale to keep the same reward scale as the original reward
         self.prev_step_reward = reward
 
         if self.use_rel_reward:
@@ -236,6 +250,19 @@ class ManiskillEnv(gym.Env):
         self.returns = torch.zeros(
             self.num_envs, device=self.device, dtype=torch.float32
         )
+        # Per-component reward accumulators. Keys are populated on-the-fly the
+        # first time a `reward_*` component appears in `infos`. Any task that
+        # writes `info["reward_<name>"] = tensor` in `compute_dense_reward`
+        # will get an `env/return_reward_<name>` / `env/mean_reward_<name>`
+        # series in tensorboard automatically.
+        self.reward_component_returns: dict[str, torch.Tensor] = {}
+        # Status of the last `_seed_prev_step_reward` invocation. Surfaced in
+        # tensorboard as `env/seed_prev_ok` (1.0 if seeding succeeded last
+        # reset, 0.0 otherwise) and `env/seed_prev_r0_mean` (the average r0
+        # used as the seed). This lets the user verify from tensorboard alone
+        # whether the t=0 reward bias has been removed.
+        self.last_seed_status = "uninitialized"
+        self.last_seed_r0_mean = 0.0
 
     def _reset_metrics(self, env_idx=None):
         if env_idx is not None:
@@ -246,12 +273,16 @@ class ManiskillEnv(gym.Env):
                 self.success_once[mask] = False
                 self.fail_once[mask] = False
                 self.returns[mask] = 0
+                for k in self.reward_component_returns:
+                    self.reward_component_returns[k][mask] = 0.0
         else:
             self.prev_step_reward[:] = 0
             if self.record_metrics:
                 self.success_once[:] = False
                 self.fail_once[:] = False
                 self.returns[:] = 0.0
+                for k in self.reward_component_returns:
+                    self.reward_component_returns[k][:] = 0.0
 
     def _record_metrics(self, step_reward, infos):
         episode_info = {}
@@ -265,6 +296,44 @@ class ManiskillEnv(gym.Env):
         episode_info["return"] = self.returns.clone()
         episode_info["episode_len"] = self.elapsed_steps.clone()
         episode_info["reward"] = episode_info["return"] / episode_info["episode_len"]
+
+        # Surface the seed_prev_step_reward status as numeric metrics so the
+        # user can verify from tensorboard (`env/seed_prev_ok`,
+        # `env/seed_prev_r0_mean`) whether the t=0 reward bias has been removed.
+        seed_ok = 1.0 if getattr(self, "last_seed_status", "") == "ok" else 0.0
+        episode_info["seed_prev_ok"] = torch.full(
+            (self.num_envs,), seed_ok, dtype=torch.float32, device=self.device
+        )
+        episode_info["seed_prev_r0_mean"] = torch.full(
+            (self.num_envs,),
+            float(getattr(self, "last_seed_r0_mean", 0.0)),
+            dtype=torch.float32,
+            device=self.device,
+        )
+
+        # Accumulate per-component rewards exposed by `compute_dense_reward`
+        # via keys prefixed with "reward_" in `infos`. Both the running return
+        # (sum over the episode) and the per-step mean (return / episode_len)
+        # are reported, mirroring the behaviour of "return" / "reward".
+        for key, value in list(infos.items()):
+            if not isinstance(key, str) or not key.startswith("reward_"):
+                continue
+            if not isinstance(value, torch.Tensor):
+                continue
+            comp_value = value.detach().to(
+                device=self.returns.device, dtype=self.returns.dtype
+            )
+            if comp_value.shape[0] != self.num_envs:
+                continue
+            if key not in self.reward_component_returns:
+                self.reward_component_returns[key] = torch.zeros_like(self.returns)
+            self.reward_component_returns[key] += comp_value
+            episode_info[f"return_{key}"] = self.reward_component_returns[key].clone()
+            episode_info[f"mean_{key}"] = (
+                self.reward_component_returns[key]
+                / self.elapsed_steps.clamp(min=1)
+            )
+
         infos["episode"] = episode_info
         return infos
 
@@ -288,8 +357,111 @@ class ManiskillEnv(gym.Env):
             env_idx = options["env_idx"]
             self._reset_metrics(env_idx)
         else:
+            env_idx = None
             self._reset_metrics()
+
+        # ---- Seed prev_step_reward with r0 to avoid the t=0 bias in
+        # `use_rel_reward` mode. Without this the first step after every reset
+        # would emit `r0 - 0 = r0` (the full absolute reward) as if it were a
+        # one-step gain, biasing returns/advantages on the first step of each
+        # episode. With seeding, the very first `_calc_step_reward` call gets
+        # `r1 - r0` — the true incremental progress.
+        if self.use_rel_reward:
+            self._seed_prev_step_reward(env_idx)
         return extracted_obs, infos
+
+    def _seed_log(self, msg: str):
+        """Write a diagnostic message both to stdout (with flush) and to
+        `/tmp/rlinf_seed_prev_reward.log`. The latter is bullet-proof against
+        Ray's stdout interception."""
+        import sys
+        try:
+            print(f"[ManiskillEnv][seed_prev] {msg}", flush=True)
+            sys.stdout.flush()
+        except Exception:
+            pass
+        try:
+            with open("/tmp/rlinf_seed_prev_reward.log", "a") as fh:
+                fh.write(f"[pid={os.getpid()}] {msg}\n")
+        except Exception:
+            pass
+
+    def _seed_prev_step_reward(self, env_idx=None):
+        """Compute the dense reward at the freshly-reset state and write it
+        into `self.prev_step_reward` so that the first incremental reward
+        emitted after this reset is a true `r1 - r0` delta (not `r0 - 0`).
+
+        Sets `self.last_seed_status` to one of:
+          - 'ok'                       : seeding succeeded
+          - 'no_methods'                : task lacks evaluate/compute_dense_reward
+          - 'not_tensor'                : compute_dense_reward returned non-Tensor
+          - 'shape_mismatch'            : shape of r0 != prev_step_reward
+          - 'exception:<type>:<msg>'    : an exception was raised
+        This status is then surfaced through every step's `info["episode"]`
+        so the user can verify from tensorboard whether seeding worked.
+        """
+        base_env : BaseEnv = self.env.unwrapped
+        if not hasattr(base_env, "compute_dense_reward") or not hasattr(
+            base_env, "evaluate"
+        ):
+            self.last_seed_status = "no_methods"
+            if not getattr(self, "_seed_warned_missing", False):
+                self._seed_log(
+                    "WARNING base_env has no evaluate/compute_dense_reward; "
+                    "skipping prev_step_reward seeding"
+                )
+                self._seed_warned_missing = True
+            return
+
+        try:
+            info0 = base_env.evaluate()
+            r0 = base_env.get_reward(None, None, info0)
+        except Exception as e:
+            self.last_seed_status = f"exception:{type(e).__name__}:{str(e)[:80]}"
+            if not getattr(self, "_seed_warned_exc", False):
+                import traceback
+                self._seed_log(
+                    f"EXCEPTION in evaluate/compute_dense_reward: "
+                    f"{type(e).__name__}: {e}"
+                )
+                self._seed_log(traceback.format_exc())
+                self._seed_warned_exc = True
+            return
+
+        if not torch.is_tensor(r0):
+            self.last_seed_status = "not_tensor"
+            self._seed_log(
+                f"WARNING compute_dense_reward returned {type(r0).__name__}, "
+                f"expected Tensor; skipping seeding"
+            )
+            return
+
+        r0 = r0.detach().to(
+            device=self.prev_step_reward.device, dtype=self.prev_step_reward.dtype
+        )
+        if r0.shape != self.prev_step_reward.shape:
+            self.last_seed_status = "shape_mismatch"
+            self._seed_log(
+                f"WARNING r0 shape {tuple(r0.shape)} != "
+                f"prev_step_reward shape {tuple(self.prev_step_reward.shape)}; "
+                f"skipping seeding"
+            )
+            return
+
+        if env_idx is None:
+            self.prev_step_reward[:] = r0
+        else:
+            mask = torch.zeros(self.num_envs, dtype=torch.bool, device=self.device)
+            mask[env_idx] = True
+            self.prev_step_reward[mask] = r0[mask]
+        self.last_seed_status = "ok"
+        self.last_seed_r0_mean = float(r0.mean())
+        if not getattr(self, "_seed_first_ok_logged", False):
+            self._seed_log(
+                f"OK first successful seeding, r0 mean={self.last_seed_r0_mean:.4f} "
+                f"min={float(r0.min()):.4f} max={float(r0.max()):.4f}"
+            )
+            self._seed_first_ok_logged = True
 
     def step(
         self, actions: Union[Array, dict] = None, auto_reset=True
