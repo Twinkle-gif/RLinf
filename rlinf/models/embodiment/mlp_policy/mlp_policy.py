@@ -19,6 +19,7 @@ import torch.nn.functional as F
 from torch.distributions.normal import Normal
 
 from rlinf.models.embodiment.base_policy import BasePolicy, ForwardType
+from rlinf.models.embodiment.modules.object_set_critic import ObjectSetCritic
 from rlinf.models.embodiment.modules.q_head import MultiCrossQHead, MultiQHead
 from rlinf.models.embodiment.modules.utils import get_act_func, layer_init
 from rlinf.models.embodiment.modules.value_head import ValueHead
@@ -33,9 +34,19 @@ class MLPPolicy(nn.Module, BasePolicy):
         add_value_head,
         add_q_head,
         q_head_type="default",
+        critic_obs_dim=None,
+        # ObjectSetCritic parameters
+        critic_type="mlp",
+        critic_global_dim=None,
+        critic_per_obj_dim=None,
+        critic_num_objects=None,
+        critic_obj_encoder_hidden=None,
+        critic_final_hidden=None,
+        critic_pool_mode="mean",
     ):
         super().__init__()
         self.obs_dim = obs_dim
+        self.critic_obs_dim = critic_obs_dim if critic_obs_dim is not None else obs_dim
         self.action_dim = action_dim
         self.num_action_chunks = num_action_chunks
         self.torch_compile_enabled = False
@@ -45,11 +56,26 @@ class MLPPolicy(nn.Module, BasePolicy):
         activation = "tanh"
         action_scale = None
 
+        self.critic_type = critic_type
+
         assert add_value_head + add_q_head <= 1
         if add_value_head:
-            self.value_head = ValueHead(
-                obs_dim, hidden_sizes=(256, 256, 256), activation=activation
-            )
+            if critic_type == "object_set":
+                self.value_head = ObjectSetCritic(
+                    global_dim=critic_global_dim,
+                    per_obj_dim=critic_per_obj_dim,
+                    num_objects=critic_num_objects,
+                    obj_encoder_hidden=critic_obj_encoder_hidden or (64, 64),
+                    final_hidden=critic_final_hidden or (256, 256),
+                    pool_mode=critic_pool_mode,
+                    activation=activation,
+                )
+                # Override critic_obs_dim with the ObjectSetCritic's computed input_dim
+                self.critic_obs_dim = self.value_head.input_dim
+            else:
+                self.value_head = ValueHead(
+                    self.critic_obs_dim, hidden_sizes=(256, 256, 256), activation=activation
+                )
         if add_q_head:
             self.independent_std = False
             self.final_tanh = True
@@ -104,7 +130,10 @@ class MLPPolicy(nn.Module, BasePolicy):
 
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
-        return {"states": env_obs["states"].to(device)}
+        result = {"states": env_obs["states"].to(device)}
+        if "critic_states" in env_obs:
+            result["critic_states"] = env_obs["critic_states"].to(device)
+        return result
 
     def prepare_dagger_sft_batch(self, batch):
         """Prepare replay-buffer samples for DAgger SFT updates."""
@@ -208,7 +237,9 @@ class MLPPolicy(nn.Module, BasePolicy):
             output_dict.update(entropy=entropy)
         if compute_values:
             if getattr(self, "value_head", None):
-                values = self.value_head(states)
+                # Use critic_states if available (asymmetric actor-critic)
+                value_input = forward_inputs.get("critic_states", states)
+                values = self.value_head(value_input)
                 output_dict.update(values=values)
             else:
                 raise NotImplementedError
@@ -238,6 +269,7 @@ class MLPPolicy(nn.Module, BasePolicy):
         mode: str = "train",
         calculate_values: bool = True,
         use_rsample: bool = False,
+        critic_states: torch.Tensor = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         action_mean, action_logstd = self._sample_actions(states)
 
@@ -265,7 +297,9 @@ class MLPPolicy(nn.Module, BasePolicy):
 
         chunk_actions = action.reshape(-1, self.num_action_chunks, self.action_dim)
         if hasattr(self, "value_head") and calculate_values:
-            chunk_values = self.value_head(states)
+            # Use critic_states for value estimation if available (asymmetric actor-critic)
+            value_input = critic_states if critic_states is not None else states
+            chunk_values = self.value_head(value_input)
         else:
             chunk_values = torch.zeros_like(chunk_logprobs[..., :1])
 
@@ -282,14 +316,17 @@ class MLPPolicy(nn.Module, BasePolicy):
         **kwargs,
     ):
         env_obs = self.preprocess_env_obs(env_obs=env_obs)
-
+        critic_states = env_obs.get("critic_states", None)
         action, chunk_actions, chunk_logprobs, chunk_values = self._generate_actions(
-            env_obs["states"], mode=mode, calculate_values=calculate_values
+            env_obs["states"], mode=mode, calculate_values=calculate_values,
+            critic_states=critic_states,
         )
 
         forward_inputs = {"action": action, "model_action": action}
         if return_obs:
             forward_inputs["states"] = env_obs["states"]
+            if critic_states is not None:
+                forward_inputs["critic_states"] = critic_states
 
         result = {
             "prev_logprobs": chunk_logprobs,
@@ -336,8 +373,11 @@ class MLPPolicy(nn.Module, BasePolicy):
             "states": torch.zeros(
                 (batch_size, self.obs_dim), device=device, dtype=dtype
             ),
+            "critic_states": torch.zeros(
+                (batch_size, self.critic_obs_dim), device=device, dtype=dtype
+            ),
         }
-        external_inputs = {"states"}
+        external_inputs = {"states", "critic_states"}
 
         def action_generation_func(
             inputs: dict[str, torch.Tensor],
@@ -348,6 +388,7 @@ class MLPPolicy(nn.Module, BasePolicy):
                     mode=mode,
                     calculate_values=calculate_values,
                     use_rsample=True,
+                    critic_states=inputs["critic_states"],
                 )
             )
             outputs = {
@@ -404,10 +445,15 @@ class MLPPolicy(nn.Module, BasePolicy):
         )
 
         def generate_actions_func(
-            states: torch.Tensor, mode: str, calculate_values: bool
+            states: torch.Tensor, mode: str, calculate_values: bool,
+            critic_states: torch.Tensor = None, **kwargs,
         ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
             graph_name = f"action_generation_{self.independent_std}_{self.final_tanh}_{mode}_{calculate_values}"
             inputs = {"states": states}
+            if critic_states is not None:
+                inputs["critic_states"] = critic_states
+            else:
+                inputs["critic_states"] = states  # fallback
             outputs = self.cuda_graph_manager.replay(graph_name, inputs=inputs)
             return (
                 outputs["action"],

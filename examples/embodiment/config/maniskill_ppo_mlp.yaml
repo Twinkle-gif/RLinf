@@ -26,12 +26,12 @@ runner:
     experiment_name: "maniskill_ppo_mlp"
     logger_backends: ["tensorboard"] # wandb, swanlab
 
-  max_epochs: 1000
+  max_epochs: 2000
   max_steps: -1
 
   only_eval: False
   val_check_interval: 50
-  save_interval: -1
+  save_interval: 250
 
   resume_dir: null # Optional: path to a saved checkpoint directory, such as 'checkpoints/global_step_10'. If not None, it will be used to resume training.
   ckpt_path: null  # Optional: path to a .pt checkpoint. If not None, it will be loaded after the model is instantiated (for evaluation).
@@ -62,7 +62,7 @@ algorithm:
   value_clip: 1.0
   huber_delta: 10.0
 
-  gamma: 0.99
+  gamma: 0.95
   gae_lambda: 0.9
 
   # params for rollout
@@ -89,16 +89,16 @@ env:
     total_num_envs: 1000
     auto_reset: True
     use_fixed_reset_state_ids: False
-    max_episode_steps: 50 # max episode steps for truncation
-    max_steps_per_rollout_epoch: 50
+    max_episode_steps: 100 # max episode steps for truncation
+    max_steps_per_rollout_epoch: 100
     ignore_terminations: True
     group_size: 1
   eval:
     total_num_envs: 12
     auto_reset: True
     ignore_terminations: True
-    max_episode_steps: 50
-    max_steps_per_rollout_epoch: 50
+    max_episode_steps: 100
+    max_steps_per_rollout_epoch: 100
     use_fixed_reset_state_ids: True
     group_size: 1
     video_cfg:
@@ -127,12 +127,23 @@ actor:
 
   # Override the default values in model/mlp_policy
   model:
-    model_path: ""
     model_type: "mlp_policy"
+    obs_dim: 41  # Actor obs dim (same as MoveObject): agent_state + tcp_pose(7) + obj_pose(7) + goal_pos(3) + tcp_to_obj(3) + obj_to_goal(3)
+    # --- Critic: ObjectSetCritic with per-object encoding + pooling ---
+    critic_type: "object_set"
+    critic_global_dim: 27   # agent_state(18) + tcp_pose(7) + num_placed(1) + is_grasping(1)
+    critic_per_obj_dim: 8   # obj_pos(3) + assigned_goal_pos(3) + obj_at_goal(1) + obj_to_goal_dist(1)
+    critic_num_objects: 3   # matches distribute_obj.num_objects
+    critic_obj_encoder_hidden: [64, 64]
+    critic_final_hidden: [256, 256]
+    critic_pool_mode: "mean"
+    # --- Pretrained weights from MoveObject ---
+    model_path: "logs/20260529-12:21:26-maniskill_ppo_mlp/maniskill_ppo_mlp/checkpoints/global_step_1250/actor/model_state_dict/full_weights.pt"
 
   optim:
-    lr: 1.0e-4
-    value_lr: 1.0e-4
+    lr: 5.0e-5          # Lower than move_obj (1e-4) to reduce forgetting
+    value_lr: 5.0e-4
+    critic_warmup_steps: 300
     adam_beta1: 0.9
     adam_beta2: 0.999
     adam_eps: 1.0e-08

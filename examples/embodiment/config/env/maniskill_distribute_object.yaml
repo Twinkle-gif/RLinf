@@ -6,7 +6,7 @@ wrap_obs_mode: simple
 use_full_state: False
 auto_reset: False
 ignore_terminations: False
-use_rel_reward: True
+use_rel_reward: False
 # Potential-based reward shaping (Ng, Harada, Russell 1999):
 #   r'_t = gamma * Phi(s_{t+1}) - Phi(s_t)
 # gamma is taken from the PPO discount factor (algorithm.gamma) to keep the

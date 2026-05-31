@@ -160,6 +160,15 @@ class ManiskillEnv(gym.Env):
 
         if wrap_obs_mode == "simple":
             if self.env.unwrapped.obs_mode == "state":
+                # If the underlying env supports asymmetric actor/critic obs,
+                # return separated state tensors for the policy.
+                base_env = self.env.unwrapped
+                if hasattr(base_env, "get_actor_critic_obs"):
+                    ac_obs = base_env.get_actor_critic_obs(infos)
+                    return {
+                        "states": ac_obs["actor_states"],
+                        "critic_states": ac_obs["critic_states"],
+                    }
                 return {"states": raw_obs}
             elif self.env.unwrapped.obs_mode == "rgb":
                 sensor_data = raw_obs.pop("sensor_data")
@@ -232,7 +241,7 @@ class ManiskillEnv(gym.Env):
         # stores Phi(s_t) (seeded at reset via `_seed_prev_step_reward`).
         # Policy-invariant in the optimal-policy sense.
         reward_diff = self._shaping_gamma * reward - self.prev_step_reward
-        reward_diff = reward_diff / (1-self._shaping_gamma)  # rescale to keep the same reward scale as the original reward
+        # reward_diff = reward_diff / (1-self._shaping_gamma)  # rescale to keep the same reward scale as the original reward
         self.prev_step_reward = reward
 
         if self.use_rel_reward:

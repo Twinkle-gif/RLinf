@@ -21,7 +21,7 @@ from mani_skill.agents.robots import Panda, SO100, Fetch, WidowXAI, XArm6Robotiq
 from mani_skill.envs.sapien_env import BaseEnv
 from mani_skill.envs.tasks.tabletop.pick_cube_cfgs import PICK_CUBE_CONFIGS
 from mani_skill.sensors.camera import CameraConfig
-from mani_skill.utils import sapien_utils
+from mani_skill.utils import common, sapien_utils
 from mani_skill.utils.building import actors
 from mani_skill.utils.registration import register_env
 from mani_skill.utils.scene_builder.table import TableSceneBuilder
@@ -40,9 +40,9 @@ class DistributeObjectEnv(BaseEnv):
     SUPPORTED_ROBOTS = ["panda", "fetch", "xarm6_robotiq", "so100", "widowxai"]
     agent: Union[Panda, Fetch, XArm6Robotiq, SO100, WidowXAI]
 
-    num_objects = 1
+    num_objects = 3
     # 每个物块在构建时随机采样一个尺寸，形成"大小不同"的组合
-    obj_half_size_range = (0.02, 0.03)
+    obj_half_size_range = (0.015, 0.025)
 
     # 初始堆叠中心区域（尽量重合）
     spawn_center_region = [-0.08, 0.08, -0.08, 0.08]  # [min_x, max_x, min_y, max_y]
@@ -50,7 +50,7 @@ class DistributeObjectEnv(BaseEnv):
 
     # 目标区域参数
     goal_region_center = [0.0, 0.0]  # 目标区域的整体中心
-    goal_region_radius = 0.25  # 正多边形外接圆半径（或直线半长）
+    goal_region_radius = 0.22  # 正多边形外接圆半径（或直线半长）
     goal_thresh = 0.02  # 物体到目标点的距离阈值，小于此值算到达
 
     static_speed_thresh = 0.01
@@ -219,6 +219,9 @@ class DistributeObjectEnv(BaseEnv):
 
                 goal_site.set_pose(Pose.create_from_pq(goal_xyz))
 
+            # Fix obj-goal assignment for this episode based on initial positions
+            self._compute_fixed_assignment()
+
     @property
     def obj_positions(self) -> torch.Tensor:
         """Returns [B, N, 3]"""
@@ -239,16 +242,15 @@ class DistributeObjectEnv(BaseEnv):
         """Compute optimal assignment from objects to goals using greedy matching.
 
         Returns:
-            assigned_dists: [B, N] distances from each object to its assigned goal
+            assigned_dists: [B, N] 3D distances from each object to its assigned goal
             assigned_goal_idx: [B, N] the goal index assigned to each object
+            assigned_vectors: [B, N, 3] 3D vectors from each object to its assigned goal
         """
         b, n = obj_pos.shape[0], obj_pos.shape[1]
-        obj_xy = obj_pos[:, :, :2]  # [B, N, 2]
-        goal_xy = goal_pos[:, :, :2]  # [B, N, 2]
 
-        # Pairwise distance matrix [B, N_obj, N_goal]
+        # Pairwise 3D distance matrix [B, N_obj, N_goal]
         dist_matrix = torch.linalg.norm(
-            obj_xy.unsqueeze(2) - goal_xy.unsqueeze(1), dim=-1
+            obj_pos.unsqueeze(2) - goal_pos.unsqueeze(1), dim=-1
         )
 
         assigned_dists = torch.zeros((b, n), device=obj_pos.device)
@@ -263,9 +265,6 @@ class DistributeObjectEnv(BaseEnv):
             goal_idx = min_idx % n
 
             batch_idx = torch.arange(b, device=obj_pos.device)
-            # 下面的操作等价于：
-            # for bi in range(b):
-            #   assigned_dists[bi, obj_idx[bi]] = dist_matrix[bi, obj_idx[bi], goal_idx[bi]]
             assigned_dists[batch_idx, obj_idx] = dist_matrix[batch_idx, obj_idx, goal_idx]
             assigned_goal_idx[batch_idx, obj_idx] = goal_idx
 
@@ -275,55 +274,184 @@ class DistributeObjectEnv(BaseEnv):
                 work_dist[bi, oi, :] = float('inf')
                 work_dist[bi, :, gi] = float('inf')
 
-        return assigned_dists, assigned_goal_idx
+        # Compute vectors from each object to its assigned goal [B, N, 3]
+        batch_idx = torch.arange(b, device=obj_pos.device).unsqueeze(1).expand(-1, n)
+        assigned_goals = goal_pos[batch_idx, assigned_goal_idx]  # [B, N, 3]
+        assigned_vectors = assigned_goals - obj_pos  # [B, N, 3]
+
+        return assigned_dists, assigned_goal_idx, assigned_vectors
+
+    def _compute_fixed_assignment(self):
+        """Compute and cache the fixed obj-goal assignment for this episode.
+
+        Called once after _initialize_episode. The assignment is based on the
+        initial positions (closest matching) and remains fixed for the entire
+        episode so the policy always knows which object goes to which goal.
+
+        Sets self._assigned_goal_idx [B, N] and self._assigned_goal_vectors [B, N, 3].
+        """
+        obj_pos = self.obj_positions  # [B, N, 3]
+        goal_pos = self.goal_positions  # [B, N, 3]
+        _, assigned_goal_idx, assigned_vectors = self._compute_obj_goal_assignment(
+            obj_pos, goal_pos
+        )
+        self._assigned_goal_idx = assigned_goal_idx  # [B, N]
+        self._assigned_goal_vectors = assigned_vectors  # [B, N, 3]
+
+    @property
+    def assigned_goal_positions(self) -> torch.Tensor:
+        """Returns [B, N, 3] - the goal position assigned to each object."""
+        goal_pos = self.goal_positions  # [B, N, 3]
+        n = goal_pos.shape[1]
+        batch_idx = torch.arange(goal_pos.shape[0], device=goal_pos.device).unsqueeze(1).expand(-1, n)
+        return goal_pos[batch_idx, self._assigned_goal_idx]  # [B, N, 3]
+
+    @property
+    def obj_to_goal_vectors(self) -> torch.Tensor:
+        """Returns [B, N, 3] - vectors from each object to its assigned goal."""
+        return self.assigned_goal_positions - self.obj_positions
 
     def _get_obs_extra(self, info: dict):
-        # NOTE: 不要依赖 `info` 里 evaluate() 填充的字段。ManiSkill 在
-        # `BaseEnv.__init__` 里会调用一次 `reset(... reconfigure=True)`，
-        # 此时第一次 `get_obs(info)` 的 info 还是空 dict（evaluate 尚未调用），
-        # 任何 `info["xxx"]` 都会 KeyError。这里所有量都用 self.* 现算。
-        goal_positions = self.goal_positions  # [B, N, 3]
+        # Minimal obs — this dict is only used by ManiSkill's internal get_obs()
+        # which produces raw_obs. When get_actor_critic_obs() exists, _wrap_obs
+        # discards raw_obs entirely, so we keep this lightweight to avoid wasted
+        # computation. All meaningful observations live in get_actor_critic_obs().
+        return dict()
+
+    def get_actor_critic_obs(self, infos: dict = None) -> dict[str, torch.Tensor]:
+        """Return separated actor/critic observations for asymmetric policy.
+
+        Actor obs: agent_state + nearest un-placed object + its assigned goal (same
+        structure as MoveObject). Objects already at their goal are masked out.
+        Critic obs: agent_state + global information (all objects, all goals, progress).
+
+        Uses the fixed obj-goal assignment from _initialize_episode, so the
+        policy always knows which object goes to which goal.
+
+        Args:
+            infos: dict from ManiSkill's get_info() (contains evaluate() results).
+                   During normal step/reset, this is always available. Falls back
+                   to self.evaluate() when infos is None or missing keys.
+
+        Returns:
+            dict with keys "actor_states" [B, actor_dim] and "critic_states" [B, critic_dim]
+        """
+        # Get agent proprioception (qpos + qvel + controller_state) and flatten
+        agent_obs = self.agent.get_proprioception()
+        agent_state = common.flatten_state_dict(
+            agent_obs, use_torch=True, device=self.device
+        )  # [B, agent_dim] agent_dim = 18
         obj_positions = self.obj_positions  # [B, N, 3]
-        obj_poses = torch.stack([obj.pose.raw_pose for obj in self.objs], dim=1)
-        b = obj_poses.shape[0]
+        b = obj_positions.shape[0]
+        n = obj_positions.shape[1]
         tcp_p = self.agent.tcp_pose.p  # [B, 3]
+        tcp_pose = self.agent.tcp_pose.raw_pose  # [B, 7]
 
-        # 相对量：TCP -> 每个物体；每个物体 -> 其最近的目标（贪心匹配的逐对距离）
-        tcp_to_objs = obj_positions - tcp_p.unsqueeze(1)  # [B, N, 3]
-        obj_to_goal_dists, _ = self._compute_obj_goal_assignment(
-            obj_positions, goal_positions
-        )  # [B, N]
+        # --- Reuse evaluate() results from infos when available ---
+        _EVAL_KEYS = ("obj_to_goal_dists", "obj_at_goal", "grasped_obj_idx",
+                       "tcp_to_obj_dists", "current_obj_idx")
+        if infos and all(k in infos for k in _EVAL_KEYS):
+            obj_to_goal_dists = infos["obj_to_goal_dists"]  # [B, N]
+            obj_at_goal = infos["obj_at_goal"]  # [B, N]
+            is_grasping = infos["grasped_obj_idx"].any(dim=1, keepdim=True).float()  # [B, 1]
+            tcp_to_obj_dists = infos["tcp_to_obj_dists"]  # [B, N]
+            current_obj_idx = infos["current_obj_idx"]  # [B]
+        else:
+            # Fallback: compute ourselves (e.g. during reset before evaluate ran)
+            eval_info = self.evaluate()
+            obj_to_goal_dists = eval_info["obj_to_goal_dists"]  # [B, N]
+            obj_at_goal = eval_info["obj_at_goal"]  # [B, N]
+            is_grasping = eval_info["grasped_obj_idx"].any(dim=1, keepdim=True).float()  # [B, 1]
+            tcp_to_obj_dists = eval_info["tcp_to_obj_dists"]  # [B, N]
+            current_obj_idx = eval_info["current_obj_idx"]  # [B]
 
-        # is_grasping 也现算，避免依赖 info
-        is_grasping = torch.zeros(b, dtype=torch.float32, device=obj_poses.device)
-        for obj in self.objs:
-            grasp = self.agent.is_grasping(obj)
-            grasp = grasp.squeeze() if grasp.dim() > 1 else grasp
-            is_grasping = is_grasping + grasp.float()
-        is_grasping = (is_grasping > 0).float().unsqueeze(-1)  # [B, 1]
+        # Fixed assignment: which goal each object is assigned to
+        assigned_goal_pos = self.assigned_goal_positions  # [B, N, 3]
+        obj_to_goal_vecs = self.obj_to_goal_vectors  # [B, N, 3]
 
-        obs = dict(
-            tcp_pose=self.agent.tcp_pose.raw_pose,
-            obj_poses=obj_poses.reshape(b, -1),
-            goal_positions=goal_positions.reshape(b, -1),
-            tcp_to_objs=tcp_to_objs.reshape(b, -1),  # [B, N*3]
-            obj_to_goal_dist=obj_to_goal_dists.reshape(b, -1),  # [B, N]
-            is_grasping=is_grasping,  # [B, 1]
-        )
-        return obs
+        batch_idx = torch.arange(b, device=obj_positions.device)
+
+        current_obj_pos = obj_positions[batch_idx, current_obj_idx]  # [B, 3]
+        obj_poses_all = torch.stack([obj.pose.raw_pose for obj in self.objs], dim=1)  # [B, N, 7]
+        current_obj_pose = obj_poses_all[batch_idx, current_obj_idx]  # [B, 7]
+
+        # Use fixed assignment for goal
+        current_goal_pos = assigned_goal_pos[batch_idx, current_obj_idx]  # [B, 3]
+        current_obj_to_goal = obj_to_goal_vecs[batch_idx, current_obj_idx]  # [B, 3]
+
+        tcp_to_obj = current_obj_pos - tcp_p  # [B, 3]
+
+        # ===== Actor obs: agent_state + MoveObject-like structure =====
+        actor_obs = torch.cat([
+            agent_state,         # [B, agent_dim]
+            tcp_pose,            # [B, 7]
+            current_obj_pose,    # [B, 7]
+            current_goal_pos,    # [B, 3]
+            tcp_to_obj,          # [B, 3]
+            current_obj_to_goal, # [B, 3]
+        ], dim=-1)
+
+        # ===== Critic obs: [global_features | per_obj_features_flat] =====
+        # Layout: global (agent_state + tcp_pose + num_placed + is_grasping)
+        #       + per-object (obj_pos + assigned_goal_pos + obj_at_goal + obj_to_goal_dist)
+        #         repeated N times and flattened.
+        # This layout enables ObjectSetCritic to split the tensor into
+        # global vs per-object parts, encode per-object features with a
+        # shared MLP, pool, and combine with global features.
+
+        # Global features
+        num_placed = obj_at_goal.float().sum(dim=1, keepdim=True)  # [B, 1]
+        global_feat = torch.cat([
+            agent_state,   # [B, agent_dim]
+            tcp_pose,      # [B, 7]
+            num_placed,    # [B, 1]
+            is_grasping,   # [B, 1]
+        ], dim=-1)  # [B, global_dim]
+
+        # Per-object features: [B, N, per_obj_dim] -> [B, N * per_obj_dim]
+        per_obj_feat = torch.cat([
+            obj_positions,         # [B, N, 3]
+            assigned_goal_pos,     # [B, N, 3]
+            obj_at_goal.float().unsqueeze(-1),  # [B, N, 1]
+            obj_to_goal_dists.unsqueeze(-1),    # [B, N, 1]
+        ], dim=-1)  # [B, N, 8]
+
+        critic_obs = torch.cat([global_feat, per_obj_feat.reshape(b, -1)], dim=-1) # [B,43(num_obj=2时)]
+
+        return {"actor_states": actor_obs, "critic_states": critic_obs}
 
     def evaluate(self):
         obj_positions = self.obj_positions  # [B, N, 3]
-        goal_positions = self.goal_positions  # [B, N, 3]
+        b, n = obj_positions.shape[:2]
+        tcp_p = self.agent.tcp_pose.p  # [B, 3]
 
-        # Compute assignment distances and indices
-        obj_to_goal_dists, assigned_goal_idx = self._compute_obj_goal_assignment(
-            obj_positions, goal_positions
-        )  # [B, N], [B, N]
+        # Use fixed assignment from _initialize_episode
+        if hasattr(self, "_assigned_goal_idx"):
+            obj_to_goal_vecs = self.obj_to_goal_vectors  # [B, N, 3]
+            obj_to_goal_dists = torch.linalg.norm(obj_to_goal_vecs, dim=-1)  # [B, N]
+        else:
+            # Fallback for init phase
+            goal_positions = self.goal_positions
+            obj_to_goal_dists, _, _ = self._compute_obj_goal_assignment(
+                obj_positions, goal_positions
+            )
 
-        # Per-object mask: whether each object is already at its goal
+        # Per-object mask: whether each object is already at its assigned goal
         obj_at_goal = obj_to_goal_dists < self.goal_thresh  # [B, N]
         all_at_goal = obj_at_goal.all(dim=1)  # [B]
+
+        # TCP-to-object 3D distances (used by actor target selection & reward)
+        tcp_to_obj_dists = torch.linalg.norm(
+            obj_positions - tcp_p.unsqueeze(1), dim=-1
+        )  # [B, N]
+
+        # Current target: nearest un-placed object to TCP
+        not_at_goal = ~obj_at_goal  # [B, N]
+        has_unplaced = not_at_goal.any(dim=1)  # [B]
+        tcp_to_obj_dists_masked = tcp_to_obj_dists.clone()
+        tcp_to_obj_dists_masked[obj_at_goal] = float('inf')
+        current_obj_idx = tcp_to_obj_dists_masked.argmin(dim=1)  # [B]
+        current_obj_idx[~has_unplaced] = n - 1  # fallback
 
         # Check if objects are static
         obj_speeds = self.obj_speeds  # [B, N]
@@ -331,26 +459,29 @@ class DistributeObjectEnv(BaseEnv):
         is_static = max_obj_speed < self.static_speed_thresh
 
         # Check if the robot is grasping any object (OR over all objects)
-        is_grasping = torch.zeros(obj_positions.shape[0], dtype=torch.bool, device=obj_positions.device)
-        grasped_obj_idx = torch.zeros_like(obj_at_goal, dtype=torch.bool) # [B, N]
+        is_grasping = torch.zeros(b, dtype=torch.bool, device=obj_positions.device)
+        grasped_obj_idx = torch.zeros_like(obj_at_goal, dtype=torch.bool)  # [B, N]
         for i, obj in enumerate(self.objs):
-            is_obj_grasped = self.agent.is_grasping(obj) # [B]
+            is_obj_grasped = self.agent.is_grasping(obj)  # [B]
             is_grasping = is_grasping | is_obj_grasped
             grasped_obj_idx[:, i] = is_obj_grasped.squeeze() if is_obj_grasped.dim() > 1 else is_obj_grasped
 
         success = all_at_goal & is_static
 
-        return {
-            "success": success, # [B]
-            "all_at_goal": all_at_goal, # [B]
-            "is_static": is_static, # [B]
-            "is_grasping": is_grasping, # [B]
-            "obj_at_goal": obj_at_goal, # [B, N]
+        result = {
+            "success": success,  # [B]
+            "all_at_goal": all_at_goal,  # [B]
+            "is_static": is_static,  # [B]
+            "is_grasping": is_grasping,  # [B]
+            "obj_at_goal": obj_at_goal,  # [B, N]
             "obj_to_goal_dists": obj_to_goal_dists,  # [B, N]
-            "assigned_goal_idx": assigned_goal_idx, # [B, N]
-            "obj_speeds": obj_speeds, # [B, N]
-            "grasped_obj_idx": grasped_obj_idx, # [B, N]
+            "obj_speeds": obj_speeds,  # [B, N]
+            "grasped_obj_idx": grasped_obj_idx,  # [B, N]
+            "tcp_to_obj_dists": tcp_to_obj_dists,  # [B, N]
+            "current_obj_idx": current_obj_idx,  # [B]
         }
+
+        return result
 
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         """Dense reward with grasp-conditioned approach and global placement reward.
@@ -382,9 +513,13 @@ class DistributeObjectEnv(BaseEnv):
         #    high above the cube and still get a "near" reward, which causes
         #    the policy to learn a degenerate "hover-away" behaviour.
         # =====================================================================
-        tcp_to_obj_dist = torch.linalg.norm(
-            obj_positions - tcp_pos.unsqueeze(1), dim=-1
-        )  # [B, N]
+        # Reuse tcp_to_obj_dists from evaluate() if available
+        if "tcp_to_obj_dists" in info:
+            tcp_to_obj_dist = info["tcp_to_obj_dists"]  # [B, N]
+        else:
+            tcp_to_obj_dist = torch.linalg.norm(
+                obj_positions - tcp_pos.unsqueeze(1), dim=-1
+            )  # [B, N]
 
         # Mask out already-placed objects so they don't affect the min
         tcp_to_unplaced = tcp_to_obj_dist.clone()
@@ -403,23 +538,24 @@ class DistributeObjectEnv(BaseEnv):
         # 3) Disturbance penalty: penalize non-grasped objects being moved
         #    Any object NOT currently being grasped should stay still.
         # =====================================================================
-        # grasped_obj_idx = info["grasped_obj_idx"]  # [B, N] bool
-        # non_grasped_speeds = obj_speeds.clone()
-        # non_grasped_speeds[grasped_obj_idx] = 0.0  # ignore the grasped object's speed
-        # disturbance_penalty = torch.tanh(10.0 * non_grasped_speeds.sum(dim=1))  # [0, 1]
+        current_obj_idx = info["current_obj_idx"]  # [B, N] bool
+        not_current_speeds = obj_speeds.clone()
+        not_current_speeds[current_obj_idx] = 0.0  # ignore the grasped object's speed
+        disturbance_penalty = torch.tanh(3.0 * not_current_speeds.sum(dim=1))  # [0, 1]
 
         # =====================================================================
         # 4) Combine
         # =====================================================================
         approach_term = 1.0 * approach_reward
         placement_term = 1.0 * placement_reward
-        # disturbance_term = -0.3 * disturbance_penalty
+        disturbance_term = -1.0 * disturbance_penalty
         success_bonus = torch.zeros_like(approach_term)
-        success_bonus[info["success"]] = 3.0
-        grasping_bonus = torch.zeros_like(approach_term)
-        grasping_bonus[info["is_grasping"]] = 1.0
+        success_bonus[info["success"]] = 5.0
+        # grasping_bonus = torch.zeros_like(approach_term)
+        # grasping_bonus[info["is_grasping"]] = 1.0
+        obj_at_goal_bonus = info["obj_at_goal"].float().sum(dim=1) # [B]
 
-        reward = approach_term + placement_term + success_bonus + grasping_bonus # + disturbance_term 
+        reward = approach_term + placement_term + success_bonus + disturbance_term + obj_at_goal_bonus
 
         # Expose per-component rewards through `info` so that the env wrapper
         # (`maniskill_env.MS3VecEnv._record_metrics`) can accumulate them into

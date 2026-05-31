@@ -249,7 +249,6 @@ class MultiStepRolloutWorker(Worker):
     def predict(
         self, env_obs: dict[str, Any], mode: Literal["train", "eval"] = "train"
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        # breakpoint()
         kwargs = (
             self._train_sampling_params
             if mode == "train"
@@ -397,7 +396,6 @@ class MultiStepRolloutWorker(Worker):
         self.update_dagger_beta()
         for _ in range(self.n_train_chunk_steps):
             for _ in range(self.num_pipeline_stages):
-                # breakpoint()
                 env_output = await self.recv_env_output(input_channel)
                 actions, result = self.predict(env_output["obs"])
 

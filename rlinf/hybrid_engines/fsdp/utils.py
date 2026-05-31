@@ -262,9 +262,10 @@ def get_fsdp_wrap_policy(module, config=None, is_lora=False, model_type=None):
 
     if hasattr(module, "value_head"):
         from rlinf.models.embodiment.modules.value_head import ValueHead
+        from rlinf.models.embodiment.modules.object_set_critic import ObjectSetCritic
 
         value_head_policy = functools.partial(
-            _module_wrap_policy, module_classes={ValueHead}
+            _module_wrap_policy, module_classes={ValueHead, ObjectSetCritic}
         )
         policies.append(value_head_policy)
 
