@@ -280,6 +280,37 @@ class FSDPModelManager:
         self.model = self._strategy.wrap_model(
             model=module, device_mesh=self._device_mesh
         )
+
+        # If resuming from a checkpoint whose global_step has already passed
+        # critic_warmup_steps, the saved optimizer was built WITHOUT warmup
+        # (i.e. it contains both actor and critic param_groups). To make the
+        # optimizer structure match the checkpoint, disable warmup at init.
+        # This is a no-op for fresh training (no resume_dir) and for tasks
+        # that do not use critic_warmup_steps.
+        if self.critic_warmup_steps > 0:
+            resume_dir = None
+            full_cfg = getattr(self, "cfg", None)
+            if full_cfg is not None:
+                try:
+                    resume_dir = full_cfg.get("runner", {}).get("resume_dir", None)
+                except Exception:
+                    resume_dir = None
+            if resume_dir and "global_step_" in str(resume_dir):
+                try:
+                    resumed_step = int(
+                        str(resume_dir).split("global_step_")[-1].split("/")[0]
+                    )
+                    if resumed_step >= self.critic_warmup_steps:
+                        self._logger.info(
+                            f"[FSDP] Resume step {resumed_step} >= "
+                            f"critic_warmup_steps {self.critic_warmup_steps}, "
+                            f"disable critic warmup at init to match saved "
+                            f"optimizer structure."
+                        )
+                        self.critic_warmup_steps = 0
+                except ValueError:
+                    pass
+
         self.optimizer = self.build_optimizer(
             model=self.model, enable_critic_warmup=self.critic_warmup_steps > 0
         )
@@ -431,6 +462,9 @@ class FSDPModelManager:
             lr_list = [0.0 for _ in self.optimizer.param_groups]
             if self.optimizer_steps >= self.critic_warmup_steps:
                 self.optimizer = self.build_optimizer(model=self.model)
+                self.lr_scheduler = self.build_lr_scheduler(
+                    optimizer=self.optimizer, optim_config=self._cfg.optim
+                )
                 self.critic_warmup_steps = 0
         else:
             lr_list = [group["lr"] for group in self.optimizer.param_groups]

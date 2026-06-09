@@ -345,9 +345,21 @@ class FSDPStrategyBase(ABC):
                         f"[Checkpoint] loading DCP checkpoint from {dcp_load_path}"
                     )
 
+                # Use allow_partial_load=True to tolerate schema mismatch
+                # between the current optimizer state and the saved one
+                # (e.g. extra `initial_lr` injected by LRScheduler at init,
+                # or missing fields when checkpoint was saved after the
+                # optimizer was rebuilt without re-binding the LRScheduler).
+                # Missing keys in the current state_dict will simply be left
+                # at their freshly-initialized values.
+                from torch.distributed.checkpoint.default_planner import (
+                    DefaultLoadPlanner,
+                )
+
                 dcp.load(
                     {"fsdp_checkpoint": training_state},
                     checkpoint_id=dcp_load_path,
+                    planner=DefaultLoadPlanner(allow_partial_load=True),
                 )
         except BaseException as e:
             import traceback

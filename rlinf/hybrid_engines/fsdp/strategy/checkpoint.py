@@ -126,7 +126,59 @@ class Checkpoint(Stateful):
         # lr schedulers
         if "lr_schedulers" in state:
             for lr, lr_sd in zip(self.lr_schedulers, state["lr_schedulers"]):
+                # Snapshot current (freshly built) sizes before loading.
+                # These reflect the CURRENT optimizer's param_group structure,
+                # which may differ from what the saved scheduler was built on
+                # (e.g. when optimizer was rebuilt after critic_warmup ended,
+                # leaving the saved scheduler bound to a 1-group optimizer
+                # while the current optimizer has 2 groups).
+                cur_base_lrs = list(getattr(lr, "base_lrs", []) or [])
+                cur_lr_lambdas = list(getattr(lr, "lr_lambdas", []) or [])
+
                 lr.load_state_dict(lr_sd)
+
+                # Re-align scheduler's per-group attributes with the CURRENT
+                # optimizer to avoid `zip(..., strict=True)` errors in
+                # `LambdaLR.get_lr()` and similar schedulers.
+                num_groups = len(lr.optimizer.param_groups)
+
+                if hasattr(lr, "base_lrs"):
+                    base_lrs = list(lr.base_lrs)
+                    if len(base_lrs) != num_groups:
+                        # Pad with current values, or truncate.
+                        if len(base_lrs) < num_groups:
+                            pad = cur_base_lrs[len(base_lrs):num_groups] or [
+                                base_lrs[-1]
+                            ] * (num_groups - len(base_lrs))
+                            base_lrs = base_lrs + pad
+                        else:
+                            base_lrs = base_lrs[:num_groups]
+                        lr.base_lrs = base_lrs
+
+                if hasattr(lr, "lr_lambdas"):
+                    lr_lambdas = list(lr.lr_lambdas)
+                    if len(lr_lambdas) != num_groups:
+                        if len(lr_lambdas) < num_groups:
+                            pad = cur_lr_lambdas[
+                                len(lr_lambdas):num_groups
+                            ] or [lr_lambdas[-1]] * (num_groups - len(lr_lambdas))
+                            lr_lambdas = lr_lambdas + pad
+                        else:
+                            lr_lambdas = lr_lambdas[:num_groups]
+                        lr.lr_lambdas = lr_lambdas
+
+                # Some schedulers also keep `_last_lr` per group; align it too
+                # so subsequent step() calls don't trip over length mismatch.
+                if hasattr(lr, "_last_lr"):
+                    last_lr = list(lr._last_lr)
+                    if len(last_lr) != num_groups:
+                        if len(last_lr) < num_groups:
+                            last_lr = last_lr + [last_lr[-1]] * (
+                                num_groups - len(last_lr)
+                            )
+                        else:
+                            last_lr = last_lr[:num_groups]
+                        lr._last_lr = last_lr
 
         if "rng" in state:
             set_rng_state(state["rng"])

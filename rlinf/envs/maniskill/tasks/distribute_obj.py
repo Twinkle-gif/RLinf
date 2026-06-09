@@ -222,6 +222,42 @@ class DistributeObjectEnv(BaseEnv):
             # Fix obj-goal assignment for this episode based on initial positions
             self._compute_fixed_assignment()
 
+            # ---- Per-episode buffers used by reward shaping & fail detection ----
+            # Note: these are written for ALL envs in the batch on every reset.
+            # When some envs reset partially, ManiSkill calls _initialize_episode
+            # only for those env_idx; we still want to keep the OTHER envs'
+            # buffers untouched, so we create the tensors lazily and only update
+            # the relevant slice.
+            init_obj_pos = self.obj_positions  # [B_total, N, 3]
+            B_total, N = init_obj_pos.shape[0], init_obj_pos.shape[1]
+            init_dists = torch.linalg.norm(self.obj_to_goal_vectors, dim=-1)  # [B_total, N]
+
+            if (
+                not hasattr(self, "_prev_obj_to_goal_dists")
+                or self._prev_obj_to_goal_dists.shape != (B_total, N)
+            ):
+                self._prev_obj_to_goal_dists = init_dists.clone()
+                self._max_obj_at_goal_count = torch.zeros(
+                    (B_total,), dtype=torch.float32, device=self.device
+                )
+                self._has_failed = torch.zeros(
+                    (B_total,), dtype=torch.bool, device=self.device
+                )
+            else:
+                # Partial reset: only overwrite rows in env_idx
+                self._prev_obj_to_goal_dists[env_idx] = init_dists[env_idx]
+                self._max_obj_at_goal_count[env_idx] = 0.0
+                self._has_failed[env_idx] = False
+
+    # ===================================================================
+    # Workspace bounds for "object knocked out of reach" detection.
+    # If any object's xy goes outside this box (or z drops below the table),
+    # we consider the episode irrecoverably failed.
+    # The box is sized as goal_region_radius * margin around goal_region_center.
+    # ===================================================================
+    workspace_xy_margin = 1.6   # box half-extent = goal_region_radius * margin
+    workspace_z_min = -0.05     # below table top
+
     @property
     def obj_positions(self) -> torch.Tensor:
         """Returns [B, N, 3]"""
@@ -468,8 +504,45 @@ class DistributeObjectEnv(BaseEnv):
 
         success = all_at_goal & is_static
 
+        # =====================================================================
+        # Collision-aware failure detection
+        # ---------------------------------------------------------------------
+        # Any object whose xy goes outside the workspace box, or whose z drops
+        # below the table, is considered "knocked out of reach" -> the episode
+        # has irrecoverably failed. We latch the failure (sticky) so even if
+        # the object happens to roll back into bounds in a later step, the
+        # episode is still marked as failed.
+        # =====================================================================
+        xy_limit = float(self.goal_region_radius * self.workspace_xy_margin)
+        out_of_xy = (obj_positions[..., :2].abs() > xy_limit).any(dim=-1)  # [B, N]
+        below_table = obj_positions[..., 2] < self.workspace_z_min          # [B, N]
+        out_of_workspace = (out_of_xy | below_table).any(dim=1)             # [B]
+
+        if hasattr(self, "_has_failed") and self._has_failed.shape[0] == b:
+            self._has_failed = self._has_failed | out_of_workspace
+            fail = self._has_failed.clone()
+        else:
+            fail = out_of_workspace
+
+        # =====================================================================
+        # Monotonic max-placed counter (used by reward to remove the perverse
+        # incentive of "knock a placed object away then place it again").
+        # =====================================================================
+        cur_placed_count = obj_at_goal.float().sum(dim=1)  # [B]
+        if (
+            hasattr(self, "_max_obj_at_goal_count")
+            and self._max_obj_at_goal_count.shape[0] == b
+        ):
+            self._max_obj_at_goal_count = torch.maximum(
+                self._max_obj_at_goal_count, cur_placed_count
+            )
+            max_placed_count = self._max_obj_at_goal_count.clone()
+        else:
+            max_placed_count = cur_placed_count
+
         result = {
             "success": success,  # [B]
+            "fail": fail,  # [B]  -- picked up automatically by maniskill_env wrapper
             "all_at_goal": all_at_goal,  # [B]
             "is_static": is_static,  # [B]
             "is_grasping": is_grasping,  # [B]
@@ -479,6 +552,8 @@ class DistributeObjectEnv(BaseEnv):
             "grasped_obj_idx": grasped_obj_idx,  # [B, N]
             "tcp_to_obj_dists": tcp_to_obj_dists,  # [B, N]
             "current_obj_idx": current_obj_idx,  # [B]
+            "max_placed_count": max_placed_count,  # [B]
+            "out_of_workspace": out_of_workspace,  # [B] (raw, this-step only)
         }
 
         return result
@@ -486,91 +561,160 @@ class DistributeObjectEnv(BaseEnv):
     def compute_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
         """Dense reward with grasp-conditioned approach and global placement reward.
 
-        - Approach reward (only when NOT grasping):
-            1 - tanh(mean distance from TCP to all un-placed objects)
-            Encourages the gripper to move towards objects that still need placement.
-
-        - Placement reward (always active):
-            1 - tanh(mean distance from all objects to their assigned goals)
-            Encourages reducing every object's distance to its target.
-
-        - Disturbance penalty (always active):
-            Penalizes moving objects that are already at their goals.
-
-        - Success bonus: large bonus when all objects placed and static.
+        Reward components:
+          (1) approach_term     : encourage TCP to move towards the nearest
+                                  un-placed object (3D distance based).
+          (2) placement_term    : encourage every object to move towards its
+                                  assigned goal.
+          (3) disturbance_term  : penalize *non-current-target* objects being
+                                  pushed AWAY from their goals (per-step delta,
+                                  with extra weight on already-placed objects).
+                                  This replaces the previous speed-based
+                                  penalty which had a broadcasting bug.
+          (4) obj_at_goal_bonus : monotonic count of placed objects (uses
+                                  running max) -- prevents the policy from
+                                  knocking a placed object away then placing
+                                  it again to farm the bonus.
+          (5) success_bonus     : +5 once all objects are placed and static.
+          (6) fail_penalty      : -5 (one-shot, on the step the failure first
+                                  happens) when any object is knocked outside
+                                  the workspace box.
         """
         obj_positions = self.obj_positions  # [B, N, 3]
         tcp_pos = self.agent.tcp_pose.p  # [B, 3]
+        b, n = obj_positions.shape[0], obj_positions.shape[1]
 
         obj_to_goal_dists = info["obj_to_goal_dists"]  # [B, N]
         obj_at_goal = info["obj_at_goal"]  # [B, N] bool
-        obj_speeds = info["obj_speeds"]  # [B, N]
+        current_obj_idx = info["current_obj_idx"]  # [B] long  (NOT [B, N] -- the
+                                                   # original comment was wrong)
 
         # =====================================================================
         # 1) Approach reward
         #    = 1 - tanh(5 * 3D TCP-to-obj distance)
-        #    Use full 3D distance (xyz), not just xy: otherwise TCP can sit
-        #    high above the cube and still get a "near" reward, which causes
-        #    the policy to learn a degenerate "hover-away" behaviour.
+        #    Use full 3D distance (xyz), not just xy.
         # =====================================================================
-        # Reuse tcp_to_obj_dists from evaluate() if available
         if "tcp_to_obj_dists" in info:
             tcp_to_obj_dist = info["tcp_to_obj_dists"]  # [B, N]
         else:
             tcp_to_obj_dist = torch.linalg.norm(
                 obj_positions - tcp_pos.unsqueeze(1), dim=-1
-            )  # [B, N]
+            )
 
-        # Mask out already-placed objects so they don't affect the min
         tcp_to_unplaced = tcp_to_obj_dist.clone()
-        tcp_to_unplaced[obj_at_goal] = torch.tensor(float('inf'))  # [B, N]
+        tcp_to_unplaced[obj_at_goal] = torch.tensor(float("inf"))
         tcp_to_unplaced_min = tcp_to_unplaced.min(dim=1).values  # [B]
         approach_reward = 1 - torch.tanh(5.0 * tcp_to_unplaced_min)  # [0, 1]
 
         # =====================================================================
-        # 2) Placement reward (always active):
-        #    = 1 - tanh( mean obj-to-goal distance across ALL objects )
+        # 2) Placement reward
         # =====================================================================
         placement_reward_individual = 1 - torch.tanh(5.0 * obj_to_goal_dists)  # [B, N]
-        placement_reward = torch.sum(placement_reward_individual, dim=1)
+        placement_reward = torch.sum(placement_reward_individual, dim=1)  # [B]
 
         # =====================================================================
-        # 3) Disturbance penalty: penalize non-grasped objects being moved
-        #    Any object NOT currently being grasped should stay still.
+        # 3) Disturbance penalty (FIXED)
+        #    For every NON-current-target object, look at how much its
+        #    obj-to-goal distance INCREASED since last step. Push-towards-goal
+        #    (delta < 0) gets no penalty; only pushes AWAY are penalized.
+        #    Already-placed objects get a ×3 weight so the policy learns to
+        #    treat them as "do not touch".
         # =====================================================================
-        current_obj_idx = info["current_obj_idx"]  # [B, N] bool
-        not_current_speeds = obj_speeds.clone()
-        not_current_speeds[current_obj_idx] = 0.0  # ignore the grasped object's speed
-        disturbance_penalty = torch.tanh(3.0 * not_current_speeds.sum(dim=1))  # [0, 1]
+        if (
+            hasattr(self, "_prev_obj_to_goal_dists")
+            and self._prev_obj_to_goal_dists.shape == obj_to_goal_dists.shape
+        ):
+            prev_dists = self._prev_obj_to_goal_dists
+        else:
+            # First step or shape mismatch -> no delta available, treat as 0.
+            prev_dists = obj_to_goal_dists
+
+        # Δ>0 means "moved away from goal"
+        delta_away = (obj_to_goal_dists - prev_dists).clamp(min=0.0)  # [B, N]
+
+        # Build a [B, N] bool mask: True for "non current target" objects
+        # current_obj_idx is [B] long
+        all_idx = torch.arange(n, device=obj_positions.device).unsqueeze(0)  # [1, N]
+        is_current = all_idx == current_obj_idx.unsqueeze(1)  # [B, N]
+        non_current_mask = ~is_current  # [B, N]
+
+        # Weight: already-placed = 3.0, others = 1.0
+        placed_weight = torch.where(
+            obj_at_goal,
+            torch.full_like(delta_away, 3.0),
+            torch.full_like(delta_away, 1.0),
+        )  # [B, N]
+
+        weighted_delta = delta_away * placed_weight * non_current_mask.float()  # [B, N]
+        # Multiply by 50 so a 2cm push of one cube gives ~tanh(50*0.02*1)=tanh(1)≈0.76
+        disturbance_penalty = torch.tanh(50.0 * weighted_delta.sum(dim=1))  # [B], in [0, 1]
+
+        # Cache current dists for next step's delta computation
+        self._prev_obj_to_goal_dists = obj_to_goal_dists.detach().clone()
 
         # =====================================================================
-        # 4) Combine
+        # 4) Monotonic obj_at_goal bonus
+        #    Use the running MAX of placed-count instead of the instantaneous
+        #    count, so knocking a placed object away then re-placing it does
+        #    not generate any "free" reward.
+        # =====================================================================
+        if "max_placed_count" in info:
+            obj_at_goal_bonus = info["max_placed_count"]  # [B] float
+        else:
+            obj_at_goal_bonus = obj_at_goal.float().sum(dim=1)  # fallback
+
+        # =====================================================================
+        # 5) Success bonus & 6) Fail penalty
+        # =====================================================================
+        success_bonus = torch.zeros_like(approach_reward)
+        success_bonus[info["success"]] = 5.0
+
+        fail_penalty = torch.zeros_like(approach_reward)
+        # Only fire on the FIRST step the failure happens, to avoid stacking
+        # -5 every step until episode end (which would massively skew returns).
+        if "out_of_workspace" in info:
+            fail_penalty[info["out_of_workspace"]] = -5.0
+
+        # =====================================================================
+        # 7) Combine
         # =====================================================================
         approach_term = 1.0 * approach_reward
         placement_term = 1.0 * placement_reward
         disturbance_term = -1.0 * disturbance_penalty
-        success_bonus = torch.zeros_like(approach_term)
-        success_bonus[info["success"]] = 5.0
-        # grasping_bonus = torch.zeros_like(approach_term)
-        # grasping_bonus[info["is_grasping"]] = 1.0
-        obj_at_goal_bonus = info["obj_at_goal"].float().sum(dim=1) # [B]
 
-        reward = approach_term + placement_term + success_bonus + disturbance_term + obj_at_goal_bonus
+        reward = (
+            approach_term
+            + placement_term
+            + disturbance_term
+            + obj_at_goal_bonus
+            + success_bonus
+            + fail_penalty
+        )
 
-        # Expose per-component rewards through `info` so that the env wrapper
-        # (`maniskill_env.MS3VecEnv._record_metrics`) can accumulate them into
-        # `info["episode"]` and the runner can log them to tensorboard as
-        # `env/reward_<component>`.
+        # Expose per-component rewards for tensorboard logging.
         info["reward_approach"] = approach_term.detach()
         info["reward_placement"] = placement_term.detach()
-        # info["reward_disturbance"] = disturbance_term.detach()
+        info["reward_disturbance"] = disturbance_term.detach()
+        info["reward_obj_at_goal_bonus"] = obj_at_goal_bonus.detach()
         info["reward_success_bonus"] = success_bonus.detach()
+        info["reward_fail_penalty"] = fail_penalty.detach()
         info["reward_total"] = reward.detach()
 
         return reward
 
     def compute_normalized_dense_reward(self, obs: Any, action: torch.Tensor, info: dict):
-        """Normalized dense reward."""
+        """Normalized dense reward.
+
+        New reward range (with N=3 objects):
+          approach   ∈ [0, 1]
+          placement  ∈ [0, N]               =  [0, 3]
+          disturbance∈ [-1, 0]
+          obj_bonus  ∈ [0, N]               =  [0, 3]
+          success    ∈ {0, +5}
+          fail       ∈ {-5, 0}              (one-shot)
+        Typical per-step magnitude is around 6-7, peak ~12, worst ~-5.
+        We divide by ~6 so the average normalized reward sits near 1.
+        """
         reward = self.compute_dense_reward(obs=obs, action=action, info=info)
-        normalized_reward = reward / 4.0
-        return normalized_reward    
+        normalized_reward = reward / 6.0
+        return normalized_reward
