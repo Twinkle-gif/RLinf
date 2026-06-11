@@ -17,3 +17,8 @@ from .move_obj import MoveObjectEnv
 from .panda_put_on_in_scene_multi import PandaPutOnPlateInScene25
 from .put_carrot_on_plate import PutCarrotOnPlateInSceneV2
 from .put_on_in_scene_multi import PutOnPlateInScene25
+from .screw_in_hand import (
+    ScrewInHandBoxNut,
+    ScrewInHandDriver,
+    ScrewInHandTriNut,
+)

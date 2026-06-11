@@ -131,7 +131,7 @@ class MLPPolicy(nn.Module, BasePolicy):
     def preprocess_env_obs(self, env_obs):
         device = next(self.parameters()).device
         result = {"states": env_obs["states"].to(device)}
-        if "critic_states" in env_obs:
+        if "critic_states" in env_obs and env_obs["critic_states"] is not None:
             result["critic_states"] = env_obs["critic_states"].to(device)
         return result
 

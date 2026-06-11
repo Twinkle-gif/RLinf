@@ -17,7 +17,6 @@ outputs/*
 .venv
 .docs-venv
 uv.lock
-rlinf/envs/maniskill/assets
 PKG-INFO
 *.egg-info/
 .claude/settings.json
